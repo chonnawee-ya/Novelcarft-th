@@ -34,8 +34,9 @@ export function ChaptersTab() {
   if (!activeProject) return null;
 
   const { chapters, metadata } = activeProject;
+  const defaultBatchSize = aiSettings.economyMode ? 3 : 5;
   const remaining = Math.max(0, metadata.targetChapterCount - chapters.length);
-  const nextBatchCount = remaining > 0 ? Math.min(5, remaining) : 5;
+  const nextBatchCount = remaining > 0 ? Math.min(defaultBatchSize, remaining) : defaultBatchSize;
 
   const handleGenerateBatch = async (steeringPrompt: string) => {
     setBatchModalOpen(false);

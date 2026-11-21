@@ -82,11 +82,13 @@ export function loadAISettings(): AISettings {
       presetId: typeof parsed.presetId === 'string' && parsed.presetId ? parsed.presetId : defaults.presetId,
       baseUrl: typeof parsed.baseUrl === 'string' ? parsed.baseUrl : defaults.baseUrl,
       model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : defaults.model,
+      fastModel: typeof parsed.fastModel === 'string' ? parsed.fastModel.trim() : '',
       temperature:
         typeof parsed.temperature === 'number' && parsed.temperature >= 0 && parsed.temperature <= 1.5
           ? parsed.temperature
           : 0.7,
       useCorsProxy: Boolean(parsed.useCorsProxy),
+      economyMode: Boolean(parsed.economyMode),
     };
   } catch {
     return defaults;

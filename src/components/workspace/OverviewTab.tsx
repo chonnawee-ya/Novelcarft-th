@@ -3,6 +3,7 @@ import {
   ArrowDown,
   ArrowUp,
   BookText,
+  Minimize2,
   Plus,
   RefreshCw,
   ScrollText,
@@ -10,7 +11,8 @@ import {
   Trash2,
 } from 'lucide-react';
 import { useAppStore } from '../../store/useAppStore';
-import { regenerateLogline, regenerateSingleBeat } from '../../services/geminiService';
+import { compressRollingSummary, regenerateLogline, regenerateSingleBeat } from '../../services/geminiService';
+import { estimateTokens } from '../../utils/tokenEstimator';
 import { SteeringModal } from '../SteeringModal';
 
 export function OverviewTab() {
@@ -118,6 +120,44 @@ export function OverviewTab() {
     });
   };
 
+  const handleCompressSummary = async () => {
+    if (!rollingSummary.trim()) return;
+    if (!isAIConfigured()) {
+      setApiModalOpen(true);
+      return;
+    }
+    const beforeTokens = estimateTokens(rollingSummary);
+    const controller = startGeneration('กำลังบีบอัด Rolling Summary ให้กระชับเพื่อประหยัด Token...');
+    try {
+      const compressed = await compressRollingSummary({
+        apiKey,
+        settings: aiSettings,
+        rollingSummary,
+        signal: controller.signal,
+        onRetry: (a, ms) =>
+          updateGenerationLabel(`ลองใหม่ครั้งที่ ${a} (รอ ${Math.round(ms / 1000)} วิ)...`),
+      });
+      await updateActiveProject((p) => {
+        p.rollingSummary = compressed;
+        return p;
+      });
+      const afterTokens = estimateTokens(compressed);
+      addToast({
+        type: 'success',
+        title: 'บีบอัด Rolling Summary เรียบร้อย!',
+        description: `ลดจาก ~${beforeTokens} เหลือ ~${afterTokens} tokens`,
+      });
+    } catch (err) {
+      addToast({
+        type: 'error',
+        title: 'บีบอัดสรุปไม่สำเร็จ',
+        description: err instanceof Error ? err.message : 'เกิดข้อผิดพลาด',
+      });
+    } finally {
+      endGeneration();
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Logline Card */}
@@ -165,11 +205,29 @@ export function OverviewTab() {
 
       {/* Rolling Summary Card */}
       <section className="bg-white rounded-2xl border border-stone-200 p-5 sm:p-6">
-        <div className="flex items-center gap-2 mb-1.5">
-          <ScrollText className="w-4 h-4 text-amber-600" />
-          <h2 className="text-sm font-bold text-stone-900">
-            สรุปเหตุการณ์สะสมล่าสุด (Rolling Summary)
-          </h2>
+        <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+          <div className="flex items-center gap-2">
+            <ScrollText className="w-4 h-4 text-amber-600" />
+            <h2 className="text-sm font-bold text-stone-900">
+              สรุปเหตุการณ์สะสมล่าสุด (Rolling Summary)
+            </h2>
+            {rollingSummary.trim() && (
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded-full bg-amber-100 text-amber-900">
+                ~{estimateTokens(rollingSummary)} tok
+              </span>
+            )}
+          </div>
+          {rollingSummary.trim().length > 100 && (
+            <button
+              type="button"
+              disabled={isGenerating}
+              onClick={handleCompressSummary}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold text-amber-900 bg-amber-100 hover:bg-amber-200 disabled:opacity-50 transition-colors"
+            >
+              <Minimize2 className="w-3.5 h-3.5" />
+              บีบอัดสรุป (ประหยัด Token)
+            </button>
+          )}
         </div>
         <p className="text-xs text-stone-500 mb-3">
           ระบบจะอัปเดตช่องนี้ให้อัตโนมัติทุกครั้งที่เจนตอนชุดใหม่ และส่งให้ AI อ่านเพื่อป้องกันพล็อตขัดแย้ง (คุณสามารถแก้ไขเองได้หากมีการปรับเนื้อหาตอนเก่า)

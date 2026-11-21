@@ -34,8 +34,10 @@ export function ApiKeyModal() {
   const [presetId, setPresetId] = useState(aiSettings.presetId);
   const [baseUrl, setBaseUrl] = useState(aiSettings.baseUrl);
   const [model, setModel] = useState(aiSettings.model);
+  const [fastModel, setFastModel] = useState(aiSettings.fastModel ?? '');
   const [temperature, setTemperature] = useState(aiSettings.temperature);
   const [useCorsProxy, setUseCorsProxy] = useState(Boolean(aiSettings.useCorsProxy));
+  const [economyMode, setEconomyMode] = useState(Boolean(aiSettings.economyMode));
   const [draftKey, setDraftKey] = useState(apiKeysMap[aiSettings.presetId] ?? '');
   const [showKey, setShowKey] = useState(false);
 
@@ -52,8 +54,10 @@ export function ApiKeyModal() {
       setPresetId(aiSettings.presetId);
       setBaseUrl(aiSettings.baseUrl);
       setModel(aiSettings.model);
+      setFastModel(aiSettings.fastModel ?? '');
       setTemperature(aiSettings.temperature);
       setUseCorsProxy(Boolean(aiSettings.useCorsProxy));
+      setEconomyMode(Boolean(aiSettings.economyMode));
       setDraftKey(apiKeysMap[aiSettings.presetId] ?? '');
       setFetchedModels([]);
       setTestResult(null);
@@ -78,8 +82,10 @@ export function ApiKeyModal() {
     presetId: activePreset.id,
     baseUrl: baseUrl.trim(),
     model: model.trim(),
+    fastModel: fastModel.trim(),
     temperature,
     useCorsProxy: activePreset.provider !== 'gemini' ? useCorsProxy : false,
+    economyMode,
   });
 
   const handleFetchModels = async () => {
@@ -358,6 +364,41 @@ export function ApiKeyModal() {
                 ))}
               </div>
             )}
+          </div>
+
+          {/* Dual-Model Routing & Economy Mode */}
+          <div className="rounded-xl bg-emerald-50/60 border border-emerald-200/80 p-3.5 space-y-3">
+            <div>
+              <label className="block text-xs font-bold text-emerald-950 mb-1">
+                โมเดลประหยัดสำหรับงานเบา (Fast Model — ไม่บังคับ)
+              </label>
+              <input
+                type="text"
+                list="ai-model-options"
+                value={fastModel}
+                onChange={(e) => setFastModel(e.target.value)}
+                placeholder="เช่น gpt-4o-mini, gemini-2.0-flash, deepseek-chat (เว้นว่างเพื่อใช้โมเดลหลัก)"
+                className="w-full rounded-xl border border-emerald-300/80 bg-white px-3 py-2 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-emerald-500"
+              />
+              <p className="text-[11px] text-emerald-800/80 mt-1">
+                ใช้กับงานเบา (Auto-Director, Logline, เพิ่ม Lore/ตัวละคร, บีบอัดสรุป) เพื่อประหยัดค่า API 50–70%
+              </p>
+            </div>
+
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={economyMode}
+                onChange={(e) => setEconomyMode(e.target.checked)}
+                className="mt-0.5 accent-emerald-600 rounded"
+              />
+              <div className="text-xs">
+                <span className="font-bold text-emerald-950 block">เปิดโหมดประหยัด Token (Economy Mode)</span>
+                <span className="text-[11px] text-emerald-800/85">
+                  บีบอัดบริบทให้กระชับ ส่งเฉพาะตัวละครและจังหวะที่เกี่ยวข้อง และสร้างตอนชุดละ 3 ตอนแทน 5 ตอน
+                </span>
+              </div>
+            </label>
           </div>
 
           {/* Test Connection */}

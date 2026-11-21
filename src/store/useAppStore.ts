@@ -52,6 +52,7 @@ interface AppState {
   setApiModalOpen: (open: boolean) => void;
 
   saveAIConfig: (settings: AISettings, keyForPreset: string) => void;
+  toggleEconomyMode: () => void;
   clearApiKeyForPreset: (presetId: string) => void;
   setApiStatus: (status: 'unknown' | 'connected' | 'error') => void;
 
@@ -129,6 +130,23 @@ export const useAppStore = create<AppState>((set, get) => ({
       apiKeysMap: nextMap,
       apiKey: activeKey,
       apiStatus: ready ? 'connected' : 'unknown',
+    });
+  },
+
+  toggleEconomyMode: () => {
+    const current = get().aiSettings;
+    const next: AISettings = {
+      ...current,
+      economyMode: !current.economyMode,
+    };
+    saveAISettings(next);
+    set({ aiSettings: next });
+    get().addToast({
+      type: 'info',
+      title: next.economyMode ? 'เปิดโหมดประหยัด Token แล้ว' : 'ปิดโหมดประหยัด Token แล้ว',
+      description: next.economyMode
+        ? 'ตัดบริบทส่วนเกิน ส่งเฉพาะจังหวะ/ตัวละครที่เกี่ยวข้อง และลดชุดตอนเป็น 3 ตอน/ครั้ง'
+        : 'ใช้บริบทมาตรฐานและสร้างชุดละ 5 ตอน',
     });
   },
 

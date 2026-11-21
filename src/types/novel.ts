@@ -178,8 +178,10 @@ export interface AISettings {
   presetId: string;
   baseUrl: string;
   model: string;
+  fastModel?: string;
   temperature: number;
   useCorsProxy?: boolean;
+  economyMode?: boolean;
 }
 
 export interface ToastMessage {

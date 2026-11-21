@@ -14,8 +14,10 @@ import {
   Undo2,
   Users,
   XCircle,
+  Zap,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
+import { estimateProjectContextTokens } from '../utils/tokenEstimator';
 import {
   exportAsJson,
   exportAsMarkdown,
@@ -40,6 +42,8 @@ export function Workspace() {
     undoStack,
     undoActiveProject,
     lastSavedAt,
+    aiSettings,
+    toggleEconomyMode,
     isGenerating,
     generationLabel,
     cancelGeneration,
@@ -51,6 +55,7 @@ export function Workspace() {
   if (!activeProject) return null;
 
   const writtenCount = activeProject.chapters.filter((c) => c.content?.trim()).length;
+  const tokenStats = estimateProjectContextTokens(activeProject, aiSettings.economyMode);
 
   const tabs: { id: WorkspaceTab; label: string; icon: typeof BookText; badge?: number | string }[] = [
     {
@@ -124,6 +129,36 @@ export function Workspace() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <span
+            className={`inline-flex items-center gap-1 text-xs px-2.5 py-1.5 rounded-xl font-mono font-semibold border ${
+              tokenStats.isHighPinned
+                ? 'bg-amber-50 border-amber-300 text-amber-900'
+                : 'bg-stone-50 border-stone-200 text-stone-600'
+            }`}
+            title={
+              tokenStats.isHighPinned
+                ? `ปักหมุดไว้ ${tokenStats.pinnedCount} การ์ด (แนะนำไม่เกิน 10 เพื่อประหยัด Token)`
+                : `ประมาณการบริบทพื้นฐานต่อการยิง AI 1 ครั้ง (ปักหมุด ${tokenStats.pinnedCount} การ์ด)`
+            }
+          >
+            ~{tokenStats.tokens.toLocaleString()} tok
+            {tokenStats.isHighPinned && ' ⚠️'}
+          </span>
+
+          <button
+            type="button"
+            onClick={toggleEconomyMode}
+            className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-xs font-semibold border transition-colors ${
+              aiSettings.economyMode
+                ? 'bg-emerald-600 border-emerald-600 text-white'
+                : 'bg-white border-stone-200 text-stone-600 hover:bg-stone-50'
+            }`}
+            title="สลับโหมดประหยัด Token (Smart Context Pruning + 3 ตอน/ชุด)"
+          >
+            <Zap className="w-3.5 h-3.5" />
+            {aiSettings.economyMode ? 'ประหยัด: เปิด' : 'โหมดประหยัด'}
+          </button>
+
           <span className="inline-flex items-center gap-1 text-xs text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-xl font-medium">
             <CheckCircle2 className="w-3.5 h-3.5" />
             บันทึกอัตโนมัติ{savedTime ? ` (${savedTime})` : ''}

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   Check,
   ChevronDown,
@@ -7,6 +7,7 @@ import {
   Feather,
   Palette,
   Play,
+  Scissors,
   Sparkles,
   Wand2,
 } from 'lucide-react';
@@ -17,7 +18,8 @@ import {
   PROSE_REFINE_PRESETS,
   PROSE_STYLE_PRESETS,
 } from '../../data/knowledgeBase';
-import { refineChapterProse, writeChapterProse } from '../../services/geminiService';
+import { refineChapterProse, refineSelectedProse, writeChapterProse } from '../../services/geminiService';
+import { estimateTokens } from '../../utils/tokenEstimator';
 import { SteeringModal } from '../SteeringModal';
 import { StyleAnchorModal } from '../StyleAnchorModal';
 
@@ -44,6 +46,8 @@ export function WriterTab() {
   const [refineInstruction, setRefineInstruction] = useState('');
   const [styleAnchorOpen, setStyleAnchorOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [selectionRange, setSelectionRange] = useState<{ start: number; end: number } | null>(null);
+  const proseRef = useRef<HTMLTextAreaElement>(null);
 
   if (!activeProject) return null;
 
@@ -193,7 +197,23 @@ export function WriterTab() {
     }
   };
 
-  const handleRefine = async (instructionText: string) => {
+  const selectedText =
+    selectionRange && currentChapter?.content
+      ? currentChapter.content.slice(selectionRange.start, selectionRange.end)
+      : '';
+  const hasSelection = selectedText.trim().length >= 10;
+
+  const handleSelectText = () => {
+    const el = proseRef.current;
+    if (!el) return;
+    if (el.selectionEnd - el.selectionStart >= 10) {
+      setSelectionRange({ start: el.selectionStart, end: el.selectionEnd });
+    } else {
+      setSelectionRange(null);
+    }
+  };
+
+  const handleRefine = async (instructionText: string, onlySelection = false) => {
     const clean = instructionText.trim();
     if (!clean || !currentChapter?.content?.trim()) return;
     setRefineOpen(false);
@@ -204,7 +224,52 @@ export function WriterTab() {
       return;
     }
 
-    const controller = startGeneration(`กำลังปรับปรุงสำนวนตอนที่ ${currentChapter.chapterNumber}...`);
+    if (onlySelection && selectionRange && hasSelection) {
+      const full = currentChapter.content;
+      const beforeContext = full.slice(0, selectionRange.start);
+      const targetSlice = full.slice(selectionRange.start, selectionRange.end);
+      const afterContext = full.slice(selectionRange.end);
+
+      const controller = startGeneration(
+        `Highlight-to-Refine: กำลังปรับเฉพาะท่อนที่เลือก (~${estimateTokens(targetSlice)} tok)...`
+      );
+      try {
+        const revised = await refineSelectedProse({
+          apiKey,
+          settings: aiSettings,
+          project: activeProject,
+          beforeContext,
+          selectedText: targetSlice,
+          afterContext,
+          instruction: clean,
+          signal: controller.signal,
+          onRetry: (a, ms) =>
+            updateGenerationLabel(`ลองใหม่ครั้งที่ ${a} (รอ ${Math.round(ms / 1000)} วิ)...`),
+        });
+
+        await updateActiveProject((p) => {
+          p.chapters[safeIdx].content = `${beforeContext}${revised}${afterContext}`;
+          return p;
+        });
+        setSelectionRange(null);
+        addToast({
+          type: 'success',
+          title: 'ปรับเฉพาะท่อนที่เลือกเรียบร้อย! (ประหยัด Token ~85%)',
+          description: 'สามารถกด Undo ด้านบนเพื่อย้อนกลับได้',
+        });
+      } catch (err) {
+        addToast({
+          type: 'error',
+          title: 'ปรับเฉพาะท่อนที่เลือกไม่สำเร็จ',
+          description: err instanceof Error ? err.message : 'เกิดข้อผิดพลาด',
+        });
+      } finally {
+        endGeneration();
+      }
+      return;
+    }
+
+    const controller = startGeneration(`กำลังปรับปรุงสำนวนตอนที่ ${currentChapter.chapterNumber} ทั้งตอน...`);
     try {
       const refined = await refineChapterProse({
         apiKey,
@@ -441,17 +506,51 @@ export function WriterTab() {
             </div>
           </div>
 
+          {/* Highlight-to-Refine Quick Bar (80-90% Token Savings!) */}
+          {hasSelection && (
+            <div className="px-5 py-2.5 bg-emerald-50 border-b border-emerald-200 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs text-emerald-900">
+                <Scissors className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>
+                  <strong>Highlight-to-Refine:</strong> เลือกไว้ {selectedText.length.toLocaleString()} ตัวอักษร (~{estimateTokens(selectedText)} tok) — แก้เฉพาะท่อนนี้ประหยัด Token ได้ 80–90%
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setRefineOpen(true)}
+                className="px-3 py-1 rounded-lg text-xs font-bold bg-emerald-600 text-white hover:bg-emerald-700"
+              >
+                ปรับเฉพาะท่อนที่เลือก
+              </button>
+            </div>
+          )}
+
           {/* Refine Drawer */}
           {refineOpen && currentChapter.content?.trim() && (
             <div className="px-5 py-3.5 bg-amber-50/60 border-b border-amber-200/80 space-y-2.5">
-              <p className="text-xs font-bold text-amber-950">เลือกคำสั่งปรับปรุงด่วน หรือพิมพ์คำสั่งเอง:</p>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-xs font-bold text-amber-950">
+                  {hasSelection
+                    ? `โหมดประหยัด: ปรับเฉพาะท่อนที่เลือก (${selectedText.length} ตัวอักษร)`
+                    : 'เลือกคำสั่งปรับปรุงทั้งตอน (หรือลากคลุมเฉพาะย่อหน้าด้านล่างเพื่อประหยัด Token):'}
+                </p>
+                {hasSelection && (
+                  <button
+                    type="button"
+                    onClick={() => setSelectionRange(null)}
+                    className="text-[11px] font-semibold text-stone-500 hover:text-stone-800 underline"
+                  >
+                    เปลี่ยนเป็นแก้ทั้งตอน
+                  </button>
+                )}
+              </div>
               <div className="flex flex-wrap gap-1.5">
                 {PROSE_REFINE_PRESETS.map((preset) => (
                   <button
                     key={preset}
                     type="button"
                     disabled={isGenerating}
-                    onClick={() => handleRefine(preset)}
+                    onClick={() => handleRefine(preset, hasSelection)}
                     className="text-[11px] font-medium px-2.5 py-1 rounded-lg bg-white border border-amber-200 text-amber-900 hover:bg-amber-100 transition-colors"
                   >
                     {preset}
@@ -463,16 +562,16 @@ export function WriterTab() {
                   type="text"
                   value={refineInstruction}
                   onChange={(e) => setRefineInstruction(e.target.value)}
-                  placeholder="หรือพิมพ์คำสั่งปรับปรุงเอง เช่น เพิ่มฉากปะทะคารมระหว่างพระเอกกับนางเอกให้ยาวขึ้น..."
+                  placeholder="หรือพิมพ์คำสั่งปรับปรุงเอง เช่น เพิ่มฉากปะทะคารมให้ดุเดือดขึ้น..."
                   className="flex-1 rounded-xl border border-amber-300 bg-white px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-amber-500"
                 />
                 <button
                   type="button"
                   disabled={isGenerating || !refineInstruction.trim()}
-                  onClick={() => handleRefine(refineInstruction)}
+                  onClick={() => handleRefine(refineInstruction, hasSelection)}
                   className="px-3.5 py-1.5 rounded-xl text-xs font-bold bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50"
                 >
-                  ปรับปรุงเลย
+                  {hasSelection ? 'ปรับเฉพาะท่อนที่เลือก' : 'ปรับปรุงทั้งตอน'}
                 </button>
               </div>
             </div>
@@ -501,17 +600,20 @@ export function WriterTab() {
           {/* Literary Prose Textarea */}
           <div className="p-5 flex-1">
             <textarea
+              ref={proseRef}
               rows={20}
               value={currentChapter.content ?? ''}
-              onChange={(e) =>
+              onSelect={handleSelectText}
+              onChange={(e) => {
+                setSelectionRange(null);
                 updateActiveProject(
                   (p) => {
                     p.chapters[safeIdx].content = e.target.value;
                     return p;
                   },
                   false
-                )
-              }
+                );
+              }}
               placeholder='กดปุ่ม "แต่งตอนนี้ให้เสร็จด้วย AI" ด้านบน เพื่อให้ AI เขียนเนื้อหานิยายฉบับเต็มตามโครงเรื่องที่วางไว้ หรือเริ่มพิมพ์เนื้อเรื่องเองที่นี่ได้เลย...'
               className="w-full min-h-[460px] rounded-xl border border-stone-200 bg-stone-50/20 px-5 py-4 text-[15px] text-stone-900 leading-[1.95] font-[Sarabun] focus:bg-white focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-y"
             />

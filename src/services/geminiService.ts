@@ -20,17 +20,15 @@ import {
 } from '../types/novel';
 import { z } from 'zod';
 
-const BASE_SYSTEM_INSTRUCTION = `คุณคือ "บรรณาธิการและนักวางโครงสร้างนิยายภาษาไทยมืออาชีพ" (Master Thai Fiction Editor & Story Architect)
-งานของคุณคือช่วยวางโครงสร้างนิยายสมมติ (Creative Fiction Outlining) ให้มีคุณภาพระดับตีพิมพ์
-
-กฎเหล็กที่ต้องปฏิบัติตามอย่างเคร่งครัด:
-1. ตอบกลับเป็น JSON ที่ถูกต้องตามโครงสร้างที่กำหนดเท่านั้น ห้ามใส่คำทักทาย คำอธิบายนอก JSON หรือข้อความส่วนเกิน
-2. ห้ามปล่อยฟิลด์บังคับเป็นค่าว่าง หรือใส่คำว่า "TBD" / "รอเพิ่มเติม" ทุกฟิลด์ต้องมีเนื้อหาจริงและนำไปเขียนนิยายต่อได้ทันที
-3. ใช้ภาษาไทยที่สละสลวย เป็นธรรมชาติสำหรับงานวรรณกรรม ห้ามใช้สำนวนแปลตรงตัวจากภาษาอังกฤษ (Translationese)
-4. ตั้งชื่อตัวละคร สถานที่ ระดับภาษา และอารมณ์เรื่องให้สอดคล้องกับแนวนิยาย (Genres) และโทนเรื่อง (Tone) ที่กำหนด
-5. เขียนในรูปแบบ "โครงเรื่องที่กระชับ ชัดเจน เห็นภาพการกระทำและปมขัดแย้ง" ห้ามเขียนบทสนทนายาวๆ หรือบรรยายเนื้อหานิยายเต็มตอน
-6. ข้อมูลโลก (World-Building) และตัวละครที่ถูกปักหมุด (Pinned Lore/Canon) ถือเป็นความจริงสูงสุด ห้ามละเมิดหรือขัดแย้งโดยเด็ดขาด
-7. เมื่อสร้างตอนต่อจากเดิม ต้องเชื่อมโยงต่อจาก Rolling Summary และจุดทิ้งท้าย (Cliffhanger) ของตอนก่อนหน้าอย่างสมเหตุสมผล และคุมจังหวะเรื่อง (Pacing) ให้พอดีกับจำนวนตอนเป้าหมาย ห้ามเร่งจบก่อนกำหนด`;
+const BASE_SYSTEM_INSTRUCTION = `Role: Master Thai Fiction Editor & Story Architect (Creative Fiction Outlining).
+Strict Rules:
+1. Return ONLY valid JSON matching the requested schema. No greetings, markdown, or extra text.
+2. Never leave required fields empty or use placeholders ("TBD", "-").
+3. Write ALL string values in natural, publication-grade Thai (avoid literal English translationese).
+4. Match character names, tone, and diction to the specified genres and tone.
+5. Keep outlines concise and actionable (goals, conflicts, outcomes)—do not write full prose dialogues in outline mode.
+6. Treat PINNED LORE and PINNED CHARACTERS as strict canon; never contradict them.
+7. Maintain strict continuity with Rolling Summary and prior cliffhangers; pace properly to targetChapterCount.`;
 
 const FICTION_SAFETY_SETTINGS = [
   { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_ONLY_HIGH },
@@ -120,6 +118,13 @@ function extractJsonText(raw: string): string {
 
 function normalizeBaseUrl(url: string): string {
   return url.trim().replace(/\/+$/, '');
+}
+
+function withFastModel(settings: AISettings): AISettings {
+  if (settings.fastModel && settings.fastModel.trim()) {
+    return { ...settings, model: settings.fastModel.trim() };
+  }
+  return settings;
 }
 
 async function apiFetch(
@@ -645,46 +650,95 @@ ${beatsSpecList}`;
   });
 }
 
-function buildPinnedContextBlock(project: NovelProject): string {
+/**
+ * Prompt-Cache-Friendly Static Prefix:
+ * Places deterministic project metadata + pinned lore + pinned characters at the top.
+ * When `relevantText` is provided (or economyMode is on), sends full profile only for
+ * protagonist + characters mentioned in relevantText, and compact 1-line entries for others.
+ */
+function buildStaticCanonPrefix(
+  project: NovelProject,
+  options?: { relevantText?: string; economyMode?: boolean; minimal?: boolean }
+): string {
+  const economy = Boolean(options?.economyMode);
   const pinnedWorld = project.macroOutline.worldBuilding.filter((w) => w.isPinned);
   const pinnedChars = project.macroOutline.characters.filter((c) => c.isPinned);
 
+  const header = `PROJECT: "${project.metadata.title}" | Genres: ${project.metadata.genres.join(', ')} | Tone: ${project.metadata.tone} | Audience: ${project.metadata.targetAudience} | Structure: ${project.metadata.structureTemplate} (${project.metadata.targetChapterCount} ch)
+LOGLINE: ${project.macroOutline.logline}`;
+
+  if (options?.minimal) {
+    const loreCats = pinnedWorld.map((w) => w.category).join(', ') || 'None';
+    const charRoster = pinnedChars.map((c) => `${c.name}(${c.role})`).join(', ') || 'None';
+    return `${header}\nLORE CATEGORIES: ${loreCats}\nCHARACTERS: ${charRoster}`;
+  }
+
   const worldText =
     pinnedWorld.length > 0
-      ? pinnedWorld.map((w) => `- [${w.category}]: ${w.detail}`).join('\n')
-      : '(ไม่มีรายการปักหมุด ใช้ข้อมูลโลกโดยรวมตามโครงเรื่อง)';
+      ? pinnedWorld.map((w) => `- ${w.category}: ${w.detail}`).join('\n')
+      : '(none)';
+
+  const relevantText = options?.relevantText ?? '';
+  const useRelevanceFilter = Boolean(relevantText) || economy;
 
   const charText =
     pinnedChars.length > 0
       ? pinnedChars
-          .map(
-            (c) =>
-              `- ${c.name} (${c.role}${c.archetype ? ` / ${c.archetype}` : ''}): เป้าหมาย=${c.goal} | ปม=${c.flaw} | ภูมิหลัง=${c.background}${c.relationships ? ` | ความสัมพันธ์=${c.relationships}` : ''}`
-          )
+          .map((c, idx) => {
+            const isProtagonist = idx === 0 || c.role.includes('เอก');
+            const isMentioned = relevantText ? relevantText.includes(c.name) : false;
+            if (useRelevanceFilter && !isProtagonist && !isMentioned) {
+              return `- ${c.name} (${c.role}): ${c.goal}`;
+            }
+            return `- ${c.name} (${c.role}): Goal=${c.goal} | Flaw=${c.flaw} | BG=${c.background}${c.relationships ? ` | Rel=${c.relationships}` : ''}`;
+          })
           .join('\n')
-      : '(ไม่มีตัวละครปักหมุด)';
+      : '(none)';
 
+  return `${header}\n\n[PINNED LORE - STRICT CANON]\n${worldText}\n\n[PINNED CHARACTERS - STRICT CANON]\n${charText}`;
+}
+
+/**
+ * Beat Windowing: sends only the 3 relevant/adjacent beats (prev, active, next)
+ * instead of all 15 beats, cutting input tokens by ~50%.
+ */
+function buildRelevantBeatsWindow(
+  project: NovelProject,
+  targetChapterNum: number,
+  linkedBeatHint?: string
+): string {
+  const beats = project.macroOutline.plotBeats;
+  if (beats.length === 0) return '(none)';
+  if (beats.length <= 4) {
+    return beats.map((b, i) => `${i + 1}. [${b.act}] ${b.beatName}: ${b.summary}`).join('\n');
+  }
+
+  let centerIdx = -1;
+  if (linkedBeatHint) {
+    centerIdx = beats.findIndex(
+      (b) =>
+        b.beatName.toLowerCase().includes(linkedBeatHint.toLowerCase()) ||
+        linkedBeatHint.toLowerCase().includes(b.beatName.toLowerCase())
+    );
+  }
+  if (centerIdx === -1) {
+    const ratio = Math.min(1, Math.max(0, (targetChapterNum - 1) / Math.max(1, project.metadata.targetChapterCount - 1)));
+    centerIdx = Math.round(ratio * (beats.length - 1));
+  }
+
+  const start = Math.max(0, centerIdx - 1);
+  const end = Math.min(beats.length - 1, centerIdx + 1);
+  return beats
+    .slice(start, end + 1)
+    .map((b, offset) => `${start + offset + 1}/${beats.length}. [${b.act}] ${b.beatName}: ${b.summary}`)
+    .join('\n');
+}
+
+function buildPinnedContextBlock(project: NovelProject): string {
   const beatsText = project.macroOutline.plotBeats
     .map((b, idx) => `${idx + 1}. [${b.act}] ${b.beatName}: ${b.summary}`)
     .join('\n');
-
-  return `ข้อมูลหลักของเรื่อง:
-- ชื่อเรื่อง: ${project.metadata.title}
-- แนวนิยาย: ${project.metadata.genres.join(', ')}
-- โทนเรื่อง: ${project.metadata.tone}
-- กลุ่มเป้าหมาย: ${project.metadata.targetAudience}
-- ทฤษฎีโครงเรื่อง: ${project.metadata.structureTemplate}
-- จำนวนตอนเป้าหมายทั้งหมด: ${project.metadata.targetChapterCount} ตอน
-- Logline: ${project.macroOutline.logline}
-
-[PINNED LORE / กฎของโลกที่ห้ามขัดแย้ง]:
-${worldText}
-
-[PINNED CHARACTERS / ตัวละครสำคัญที่ห้ามขัดแย้ง]:
-${charText}
-
-[MACRO PLOT BEATS / แผนที่โครงเรื่องหลัก]:
-${beatsText}`;
+  return `${buildStaticCanonPrefix(project)}\n\n[MACRO PLOT BEATS]\n${beatsText}`;
 }
 
 export async function generateChapterBatch(params: {
@@ -712,17 +766,21 @@ ${project.rollingSummary || '(ยังไม่มีสรุปสะสม)'
 - จุดทิ้งท้าย (Cliffhanger): ${lastChapter.cliffhanger}`
     : 'นี่คือชุดตอนเริ่มต้น (ตอนที่ 1) ให้เปิดเรื่องอย่างทรงพลัง ดึงดูดผู้อ่านทันทีตามโครงเรื่องหลัก';
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const staticPrefix = buildStaticCanonPrefix(project, { economyMode: settings.economyMode });
+  const activeBeats = buildRelevantBeatsWindow(project, startChapter);
+
+  const prompt = `${staticPrefix}
+
+[ACTIVE PLOT BEATS FOR THIS SECTION]
+${activeBeats}
 
 ${continuityBlock}
 
-คำสั่ง:
-สร้างโครงสร้างรายตอนตั้งแต่ **ตอนที่ ${startChapter} ถึง ตอนที่ ${endChapter}** (รวม ${count} ตอนพอดี)
-- คุมจังหวะเรื่อง (Pacing) ให้เหมาะสมกับสัดส่วนตอนปัจจุบันเทียบกับเป้าหมายทั้งหมด ${project.metadata.targetChapterCount} ตอน
-- ระบุ linkedBeat ว่าแต่ละตอนกำลังดำเนินอยู่ในจังหวะใดของ Macro Plot Beats
-- ห้ามเร่งจบเรื่องก่อนถึงตอนที่ ${project.metadata.targetChapterCount} (ยกเว้นถ้าตอนที่ ${endChapter} คือตอนสุดท้าย)
-- สร้าง updatedRollingSummary เพื่อสรุปเหตุการณ์สำคัญสะสมทั้งหมดตั้งแต่ตอนที่ 1 จนถึงตอนที่ ${endChapter} อย่างกระชับสำหรับใช้เป็นบริบทในชุดถัดไป
-${steeringPrompt?.trim() ? `\nคำสั่งเพิ่มเติมจากนักเขียน (ต้องทำตาม): ${steeringPrompt.trim()}` : ''}`;
+TASK: Generate Chapter Beats for Chapters ${startChapter} to ${endChapter} (exactly ${count} chapters) in Thai.
+- Pace appropriately toward targetChapterCount (${project.metadata.targetChapterCount}). Do NOT rush the ending before chapter ${project.metadata.targetChapterCount}.
+- Set linkedBeat to the relevant beat name.
+- Keep updatedRollingSummary crisp and compact (max 200-250 words covering key plot developments & character states from ch.1 to ch.${endChapter}).
+${steeringPrompt?.trim() ? `\nWRITER STEERING: ${steeringPrompt.trim()}` : ''}`;
 
   const jsonContract = `{
   "chapters": [
@@ -791,16 +849,23 @@ export async function regenerateSingleChapter(params: {
   const prev = chapterIndex > 0 ? project.chapters[chapterIndex - 1] : null;
   const next = chapterIndex < project.chapters.length - 1 ? project.chapters[chapterIndex + 1] : null;
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const relevantText = `${target.title} ${target.goal} ${target.conflict} ${target.summary}`;
+  const staticPrefix = buildStaticCanonPrefix(project, {
+    relevantText,
+    economyMode: settings.economyMode,
+  });
+  const activeBeats = buildRelevantBeatsWindow(project, target.chapterNumber, target.linkedBeat);
 
-คำสั่ง: สร้างโครงสร้างใหม่เฉพาะ **ตอนที่ ${target.chapterNumber}** เท่านั้น
-- ต้องเชื่อมโยงต่อจากตอนก่อนหน้าและส่งต่อไปยังตอนถัดไปได้อย่างแนบเนียน (หากมี)
-- ห้ามขัดแย้งกับข้อมูลปักหมุด
+  const prompt = `${staticPrefix}
 
-ตอนก่อนหน้า: ${prev ? `ตอนที่ ${prev.chapterNumber} (${prev.title}) — สรุป: ${prev.summary} | Cliffhanger: ${prev.cliffhanger}` : '(ไม่มี — นี่คือตอนแรก)'}
-ตอนเดิมที่ต้องการปรับปรุง: ตอนที่ ${target.chapterNumber} (${target.title}) — สรุปเดิม: ${target.summary}
-ตอนถัดไป: ${next ? `ตอนที่ ${next.chapterNumber} (${next.title}) — เป้าหมาย: ${next.goal} | สรุป: ${next.summary}` : '(ยังไม่มีตอนถัดไป)'}
-${steeringPrompt?.trim() ? `\nความต้องการเฉพาะของนักเขียนสำหรับตอนนี้: ${steeringPrompt.trim()}` : '\nให้นำเสนอทางเลือกใหม่ที่เข้มข้นและน่าติดตามยิ่งขึ้นกว่าฉบับเดิม'}`;
+[RELEVANT PLOT BEATS]
+${activeBeats}
+
+TASK: Regenerate ONLY Chapter ${target.chapterNumber} in Thai. Keep smooth continuity with prev/next chapters and strict canon.
+Prev: ${prev ? `Ch.${prev.chapterNumber} (${prev.title}) — ${prev.summary} | Cliffhanger: ${prev.cliffhanger}` : '(none — first chapter)'}
+Old Ch.${target.chapterNumber}: (${target.title}) — ${target.summary}
+Next: ${next ? `Ch.${next.chapterNumber} (${next.title}) — Goal: ${next.goal} | ${next.summary}` : '(none)'}
+${steeringPrompt?.trim() ? `\nWRITER STEERING: ${steeringPrompt.trim()}` : '\nMake this chapter sharper and more engaging than the previous draft.'}`;
 
   const jsonContract = `{
   "chapterNumber": ${target.chapterNumber},
@@ -853,12 +918,12 @@ export async function generateNewCharacter(params: {
   const { apiKey, settings, project, steeringPrompt, signal, onRetry } = params;
   const existingNames = project.macroOutline.characters.map((c) => `${c.name} (${c.role})`).join(', ');
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const prompt = `${buildStaticCanonPrefix(project, { minimal: true })}
 
-ตัวละครที่มีอยู่แล้ว: ${existingNames}
+Existing Characters: ${existingNames}
 
-คำสั่ง: ออกแบบตัวละครใหม่เพิ่ม 1 ตัว ที่ช่วยเสริมมิติ ความขัดแย้ง หรือเส้นเรื่องรองให้เรื่องนี้น่าสนใจขึ้น ห้ามตั้งชื่อซ้ำกับตัวละครเดิม
-${steeringPrompt?.trim() ? `ความต้องการเพิ่มเติมจากนักเขียน: ${steeringPrompt.trim()}` : ''}`;
+TASK: Design 1 new unique Thai novel character that adds conflict or subplot depth. Do not duplicate existing names.
+${steeringPrompt?.trim() ? `WRITER STEERING: ${steeringPrompt.trim()}` : ''}`;
 
   const jsonContract = `{
   "name": "ชื่อตัวละคร",
@@ -894,7 +959,7 @@ ${steeringPrompt?.trim() ? `ความต้องการเพิ่มเ�
     relationships: z.string().default(''),
   });
 
-  return generateStructuredJson({ apiKey, settings, prompt, schema, jsonContract, validator, signal, onRetry });
+  return generateStructuredJson({ apiKey, settings: withFastModel(settings), prompt, schema, jsonContract, validator, signal, onRetry });
 }
 
 export async function generateNewWorldItem(params: {
@@ -908,12 +973,12 @@ export async function generateNewWorldItem(params: {
   const { apiKey, settings, project, steeringPrompt, signal, onRetry } = params;
   const existingLore = project.macroOutline.worldBuilding.map((w) => w.category).join(', ');
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const prompt = `${buildStaticCanonPrefix(project, { minimal: true })}
 
-หมวดข้อมูลโลกที่มีอยู่แล้ว: ${existingLore}
+Existing Lore Categories: ${existingLore}
 
-คำสั่ง: สร้างข้อมูลการตั้งค่าโลก (World-Building / Lore) เพิ่ม 1 รายการที่ช่วยขยายมิติของเรื่องให้ลึกและสมจริงขึ้นโดยไม่ขัดแย้งกับกฎเดิม
-${steeringPrompt?.trim() ? `ความต้องการเพิ่มเติมจากนักเขียน: ${steeringPrompt.trim()}` : ''}`;
+TASK: Create 1 new World-Building/Lore entry in Thai that deepens the setting without contradicting existing lore.
+${steeringPrompt?.trim() ? `WRITER STEERING: ${steeringPrompt.trim()}` : ''}`;
 
   const jsonContract = `{ "category": "หมวดหมู่", "detail": "รายละเอียด" }`;
 
@@ -931,7 +996,7 @@ ${steeringPrompt?.trim() ? `ความต้องการเพิ่มเ�
     detail: z.string().min(1),
   });
 
-  return generateStructuredJson({ apiKey, settings, prompt, schema, jsonContract, validator, signal, onRetry });
+  return generateStructuredJson({ apiKey, settings: withFastModel(settings), prompt, schema, jsonContract, validator, signal, onRetry });
 }
 
 export async function regenerateSingleBeat(params: {
@@ -944,14 +1009,19 @@ export async function regenerateSingleBeat(params: {
   onRetry?: (attempt: number, waitMs: number) => void;
 }): Promise<PlotBeat> {
   const { apiKey, settings, project, beatIndex, steeringPrompt, signal, onRetry } = params;
-  const target = project.macroOutline.plotBeats[beatIndex];
+  const beats = project.macroOutline.plotBeats;
+  const target = beats[beatIndex];
+  const prevBeat = beatIndex > 0 ? beats[beatIndex - 1] : null;
+  const nextBeat = beatIndex < beats.length - 1 ? beats[beatIndex + 1] : null;
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const prompt = `${buildStaticCanonPrefix(project, { economyMode: true })}
 
-คำสั่ง: เขียนสรุปเหตุการณ์ใหม่เฉพาะจังหวะที่ ${beatIndex + 1} คือ [${target.act}] "${target.beatName}"
-- คงชื่อจังหวะและองก์เดิมไว้
-- ให้สอดคล้องกับจังหวะก่อนหน้าและถัดไป รวมถึงข้อมูลปักหมุด
-${steeringPrompt?.trim() ? `ความต้องการเพิ่มเติมจากนักเขียน: ${steeringPrompt.trim()}` : 'ให้ปรับปรุงให้น่าสนใจและมีปมขัดแย้งเข้มข้นขึ้น'}`;
+Prev Beat: ${prevBeat ? `[${prevBeat.act}] ${prevBeat.beatName}: ${prevBeat.summary}` : '(none)'}
+Target Beat #${beatIndex + 1}: [${target.act}] "${target.beatName}" (Old: ${target.summary})
+Next Beat: ${nextBeat ? `[${nextBeat.act}] ${nextBeat.beatName}: ${nextBeat.summary}` : '(none)'}
+
+TASK: Rewrite ONLY Target Beat #${beatIndex + 1} in Thai, keeping beatName and act intact and aligning with adjacent beats.
+${steeringPrompt?.trim() ? `WRITER STEERING: ${steeringPrompt.trim()}` : ''}`;
 
   const jsonContract = `{ "beatName": "${target.beatName}", "act": "${target.act}", "summary": "สรุปเหตุการณ์ใหม่" }`;
 
@@ -985,10 +1055,10 @@ export async function regenerateLogline(params: {
 }): Promise<string> {
   const { apiKey, settings, project, steeringPrompt, signal, onRetry } = params;
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const prompt = `${buildStaticCanonPrefix(project, { minimal: true })}
 
-คำสั่ง: เขียน Logline ภาษาไทยใหม่ 1-2 ประโยค ที่กระชับ ทรงพลัง ชวนอ่าน และสะท้อนแก่นเรื่องกับปมขัดแย้งหลักของนิยายเรื่องนี้
-${steeringPrompt?.trim() ? `ความต้องการเพิ่มเติมจากนักเขียน: ${steeringPrompt.trim()}` : ''}`;
+TASK: Write 1 compelling, publication-grade Thai Logline (1-2 sentences) capturing the core premise and main conflict.
+${steeringPrompt?.trim() ? `WRITER STEERING: ${steeringPrompt.trim()}` : ''}`;
 
   const jsonContract = `{ "logline": "ประโยค Logline ใหม่" }`;
 
@@ -1001,7 +1071,7 @@ ${steeringPrompt?.trim() ? `ความต้องการเพิ่มเ�
   };
 
   const validator = z.object({ logline: z.string().min(1) });
-  const res = await generateStructuredJson({ apiKey, settings, prompt, schema, jsonContract, validator, signal, onRetry });
+  const res = await generateStructuredJson({ apiKey, settings: withFastModel(settings), prompt, schema, jsonContract, validator, signal, onRetry });
   return res.logline;
 }
 
@@ -1009,15 +1079,13 @@ ${steeringPrompt?.trim() ? `ความต้องการเพิ่มเ�
 // NEW FEATURES: Auto-Director, Style Anchor, Stage 3 Prose Writer, Continuity Audit
 // ============================================================================
 
-const PROSE_WRITER_SYSTEM_INSTRUCTION = `คุณคือ "นักเขียนนิยายภาษาไทยมืออาชีพระดับเบสต์เซลเลอร์" (Master Thai Fiction Novelist)
-หน้าที่ของคุณคือเขียนเนื้อหานิยายภาษาไทยฉบับเต็ม (Prose) ที่อ่านสนุก ลื่นไหล มีชีวิตชีวา และชวนติดตาม
-
-กฎเหล็กในการเขียนนิยาย:
-1. เขียนเป็นเนื้อหานิยายภาษาไทยเต็มรูปแบบพร้อมอ่านทันที (ห้ามเขียนเป็นหัวข้อย่อ ห้ามใส่คำทักทายหรือคำอธิบายนอกเนื้อเรื่อง)
-2. ใช้ภาษาไทยที่สละสลวย เป็นธรรมชาติแบบนักเขียนไทยแท้ ห้ามใช้สำนวนแปลตรงตัวจากภาษาอังกฤษ
-3. ใช้หลัก "Show, Don't Tell" — แสดงอารมณ์ผ่านการกระทำ บทสนทนา สีหน้า และบรรยากาศ แทนการเล่าสรุปทื่อๆ
-4. ยึดข้อมูลที่ปักหมุด (Pinned Lore & Characters) อย่างเคร่งครัด ห้ามเปลี่ยนชื่อ นิสัย ปม หรือกฎของโลก
-5. เชื่อมต่ออารมณ์และฉากจากตอนก่อนหน้าให้เนียนสนิท และจบตอนด้วย Cliffhanger ที่ชวนให้อยากอ่านตอนต่อไปทันที`;
+const PROSE_WRITER_SYSTEM_INSTRUCTION = `Role: Bestselling Thai Fiction Novelist.
+Rules:
+1. Output ONLY ready-to-read Thai novel prose. No greetings, notes, or meta commentary.
+2. Write natural, vivid Thai literature (avoid literal English translationese).
+3. Use "Show, Don't Tell": convey emotion via action, dialogue, sensory detail, and pacing.
+4. Strictly respect PINNED LORE and PINNED CHARACTERS.
+5. Connect seamlessly from the previous chapter's ending and end with a compelling cliffhanger.`;
 
 async function generateRawText(params: {
   apiKey: string;
@@ -1222,7 +1290,7 @@ ${structureList}
 
   const result = await generateStructuredJson({
     apiKey,
-    settings,
+    settings: withFastModel(settings),
     prompt,
     schema,
     jsonContract,
@@ -1334,37 +1402,46 @@ export async function writeChapterProse(params: {
         ? 'ความยาวประมาณ 3,200–4,200 คำ (ละเอียด ลึกซึ้ง ขยี้ทุกฉากสำคัญ)'
         : 'ความยาวประมาณ 2,000–2,800 คำ (สมดุล มาตรฐานนิยายออนไลน์)';
 
+  const tailChars = settings.economyMode ? 400 : 700;
   const prevEnding = prevChapter?.content?.trim()
-    ? `ข้อความช่วงท้ายของตอนก่อนหน้า (ตอนที่ ${prevChapter.chapterNumber}) เพื่อต่อฉากให้เนียนสนิท:\n"""\n${prevChapter.content.trim().slice(-700)}\n"""`
+    ? `Prev Ch.${prevChapter.chapterNumber} Ending:\n"""\n${prevChapter.content.trim().slice(-tailChars)}\n"""`
     : prevChapter
-      ? `สรุปตอนก่อนหน้า (ตอนที่ ${prevChapter.chapterNumber}: ${prevChapter.title}): ${prevChapter.summary} | จุดทิ้งท้าย: ${prevChapter.cliffhanger}`
-      : 'นี่คือตอนที่ 1 ของเรื่อง ให้เปิดฉากอย่างทรงพลังและดึงดูดผู้อ่านตั้งแต่วรรคแรก';
+      ? `Prev Ch.${prevChapter.chapterNumber} (${prevChapter.title}): ${prevChapter.summary} | Cliffhanger: ${prevChapter.cliffhanger}`
+      : 'First chapter of the novel: hook the reader immediately from paragraph 1.';
 
   const styleAnchorBlock = ws.styleAnchor?.trim()
-    ? `\n[STYLE ANCHOR / ต้นแบบสำนวนภาษาที่ต้องเลียนแบบโทนและจังหวะให้สอดคล้อง]:\n"""\n${ws.styleAnchor.trim()}\n"""`
+    ? `\n[STYLE ANCHOR - MATCH THIS VOICE & RHYTHM]:\n"""\n${ws.styleAnchor.trim().slice(0, settings.economyMode ? 500 : 1200)}\n"""`
     : '';
 
-  const prompt = `${buildPinnedContextBlock(project)}
+  const relevantText = `${chapter.title} ${chapter.goal} ${chapter.conflict} ${chapter.outcome} ${chapter.summary}`;
+  const staticPrefix = buildStaticCanonPrefix(project, {
+    relevantText,
+    economyMode: settings.economyMode,
+  });
+  const activeBeats = buildRelevantBeatsWindow(project, chapter.chapterNumber, chapter.linkedBeat);
 
-[การตั้งค่าสไตล์การเขียน]:
-- มุมมองการเล่า (POV): ${ws.pov}
-- สไตล์ภาษา: ${ws.proseStyle}
-- ความยาวเป้าหมาย: ${lengthGuide}
-${styleAnchorBlock}
+  // Prompt-Cache-Friendly Layout: Static Canon & Style Anchor at TOP, Dynamic Chapter at BOTTOM
+  const prompt = `${staticPrefix}
 
-[ความต่อเนื่องจากตอนก่อนหน้า]:
+[WRITING STYLE]
+POV: ${ws.pov} | Style: ${ws.proseStyle} | Length: ${lengthGuide}${styleAnchorBlock}
+
+[ACTIVE PLOT BEATS]
+${activeBeats}
+
+[CONTINUITY]
 ${project.rollingSummary ? `Rolling Summary: ${project.rollingSummary}\n` : ''}${prevEnding}
 
-[โครงสร้างบังคับของตอนที่ ${chapter.chapterNumber}: "${chapter.title}"]:
-- จังหวะเรื่อง: ${chapter.linkedBeat || '-'}
-- เป้าหมายในตอน (Goal): ${chapter.goal}
-- อุปสรรค/ความขัดแย้ง (Conflict): ${chapter.conflict}
-- ผลลัพธ์ (Outcome): ${chapter.outcome}
-- จุดทิ้งท้าย (Cliffhanger): ${chapter.cliffhanger}
-- เรื่องย่อตอน: ${chapter.summary}
-${steeringPrompt?.trim() ? `\n[คำสั่งเพิ่มเติมจากนักเขียนสำหรับตอนนี้]: ${steeringPrompt.trim()}` : ''}
+[CHAPTER ${chapter.chapterNumber}: "${chapter.title}"]
+- Beat: ${chapter.linkedBeat || '-'}
+- Goal: ${chapter.goal}
+- Conflict: ${chapter.conflict}
+- Outcome: ${chapter.outcome}
+- Cliffhanger: ${chapter.cliffhanger}
+- Summary: ${chapter.summary}
+${steeringPrompt?.trim() ? `\n[WRITER STEERING]: ${steeringPrompt.trim()}` : ''}
 
-คำสั่ง: จงเขียนเนื้อหานิยายฉบับเต็มของ **ตอนที่ ${chapter.chapterNumber}: ${chapter.title}** เป็นภาษาไทยที่สละสลวย พร้อมอ่านทันที (เริ่มเนื้อเรื่องได้เลย ไม่ต้องใส่คำทักทายหรือหมายเหตุท้ายตอน)`;
+TASK: Write the full Thai novel prose for Chapter ${chapter.chapterNumber}: "${chapter.title}". Start directly with the story.`;
 
   return generateRawText({
     apiKey,
@@ -1408,6 +1485,85 @@ ${chapter.content}
     apiKey,
     settings,
     systemInstruction: PROSE_WRITER_SYSTEM_INSTRUCTION,
+    prompt,
+    signal,
+    onRetry,
+  });
+}
+
+/**
+ * Highlight-to-Refine: Sends ONLY the selected passage + ~250 chars before/after context,
+ * cutting token usage by 80-90% compared to rewriting the entire chapter.
+ */
+export async function refineSelectedProse(params: {
+  apiKey: string;
+  settings: AISettings;
+  project: NovelProject;
+  beforeContext: string;
+  selectedText: string;
+  afterContext: string;
+  instruction: string;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<string> {
+  const { apiKey, settings, project, beforeContext, selectedText, afterContext, instruction, signal, onRetry } = params;
+  const ws = project.metadata.writingStyle;
+
+  const prompt = `Novel: "${project.metadata.title}" | Tone: ${project.metadata.tone} | POV: ${ws?.pov ?? 'บุรุษที่ 3'}
+TASK: Rewrite ONLY the [SELECTED PASSAGE] below in Thai according to the writer's instruction so it blends seamlessly with [BEFORE] and [AFTER].
+Output ONLY the revised replacement text for [SELECTED PASSAGE]—do not repeat [BEFORE] or [AFTER] and add no explanations.
+
+[INSTRUCTION]: ${instruction.trim()}
+
+[BEFORE]:
+"""
+${beforeContext.slice(-280)}
+"""
+
+[SELECTED PASSAGE TO REWRITE]:
+"""
+${selectedText}
+"""
+
+[AFTER]:
+"""
+${afterContext.slice(0, 280)}
+"""`;
+
+  return generateRawText({
+    apiKey,
+    settings,
+    systemInstruction: PROSE_WRITER_SYSTEM_INSTRUCTION,
+    prompt,
+    signal,
+    onRetry,
+  });
+}
+
+/**
+ * Compresses Rolling Summary using Fast Model so context doesn't bloat over long novels.
+ */
+export async function compressRollingSummary(params: {
+  apiKey: string;
+  settings: AISettings;
+  rollingSummary: string;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<string> {
+  const { apiKey, settings, rollingSummary, signal, onRetry } = params;
+
+  const prompt = `Compress the Thai novel Rolling Summary below into a super-compact, high-density continuity brief (max 150-200 Thai words).
+Keep ONLY: major plot turns, current status/location of key characters, active secrets/mysteries, and unresolved cliffhangers. Drop filler prose.
+
+Original Rolling Summary:
+"""
+${rollingSummary}
+"""`;
+
+  return generateRawText({
+    apiKey,
+    settings: withFastModel(settings),
+    systemInstruction: 'You are a concise Thai fiction continuity editor. Output ONLY the compressed Thai summary.',
     prompt,
     signal,
     onRetry,

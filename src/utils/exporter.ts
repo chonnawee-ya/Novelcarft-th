@@ -82,11 +82,61 @@ export function exportAsMarkdown(project: NovelProject): void {
       lines.push(`- **ผลลัพธ์ (Outcome):** ${ch.outcome}`);
       lines.push(`- **จุดทิ้งท้าย (Cliffhanger):** ${ch.cliffhanger}`);
       lines.push(`- **เรื่องย่อตอน:** ${ch.summary}`);
+      if (ch.content?.trim()) {
+        lines.push('');
+        lines.push('#### เนื้อหาฉบับเต็ม');
+        lines.push(ch.content.trim());
+      }
       lines.push('');
     });
   }
 
   triggerDownload(lines.join('\n'), `${sanitizeFilename(metadata.title)}.md`, 'text/markdown');
+}
+
+export function exportManuscriptAsMarkdown(project: NovelProject): void {
+  const { metadata, macroOutline, chapters } = project;
+  const writtenChapters = chapters.filter((ch) => ch.content?.trim());
+  const lines: string[] = [];
+
+  lines.push(`# ${metadata.title}`);
+  lines.push('');
+  lines.push(`> ${macroOutline.logline}`);
+  lines.push('');
+  lines.push('---');
+  lines.push('');
+
+  writtenChapters.forEach((ch) => {
+    lines.push(`## ตอนที่ ${ch.chapterNumber}: ${ch.title}`);
+    lines.push('');
+    lines.push(ch.content.trim());
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+  });
+
+  triggerDownload(lines.join('\n'), `${sanitizeFilename(metadata.title)}_manuscript.md`, 'text/markdown');
+}
+
+export function exportManuscriptAsText(project: NovelProject): void {
+  const { metadata, chapters } = project;
+  const writtenChapters = chapters.filter((ch) => ch.content?.trim());
+  const lines: string[] = [];
+
+  lines.push(metadata.title);
+  lines.push('============================================================');
+  lines.push('');
+
+  writtenChapters.forEach((ch) => {
+    lines.push(`ตอนที่ ${ch.chapterNumber}: ${ch.title}`);
+    lines.push('------------------------------------------------------------');
+    lines.push('');
+    lines.push(ch.content.trim());
+    lines.push('');
+    lines.push('');
+  });
+
+  triggerDownload(lines.join('\n'), `${sanitizeFilename(metadata.title)}_manuscript.txt`, 'text/plain');
 }
 
 export function exportAsPlainText(project: NovelProject): void {

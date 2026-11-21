@@ -1,23 +1,34 @@
 import { useState } from 'react';
 import {
+  BookOpenText,
   BookText,
   CheckCircle2,
   Download,
+  Feather,
   FileCode2,
   FileText,
   Globe2,
   ListOrdered,
   Loader2,
+  ShieldCheck,
   Undo2,
   Users,
   XCircle,
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
-import { exportAsJson, exportAsMarkdown, exportAsPlainText } from '../utils/exporter';
+import {
+  exportAsJson,
+  exportAsMarkdown,
+  exportAsPlainText,
+  exportManuscriptAsMarkdown,
+  exportManuscriptAsText,
+} from '../utils/exporter';
 import { OverviewTab } from './workspace/OverviewTab';
 import { WorldBuildingTab } from './workspace/WorldBuildingTab';
 import { CharactersTab } from './workspace/CharactersTab';
 import { ChaptersTab } from './workspace/ChaptersTab';
+import { WriterTab } from './workspace/WriterTab';
+import { ContinuityAuditModal } from './ContinuityAuditModal';
 import type { WorkspaceTab } from '../types/novel';
 
 export function Workspace() {
@@ -35,10 +46,13 @@ export function Workspace() {
   } = useAppStore();
 
   const [exportOpen, setExportOpen] = useState(false);
+  const [auditOpen, setAuditOpen] = useState(false);
 
   if (!activeProject) return null;
 
-  const tabs: { id: WorkspaceTab; label: string; icon: typeof BookText; badge?: number }[] = [
+  const writtenCount = activeProject.chapters.filter((c) => c.content?.trim()).length;
+
+  const tabs: { id: WorkspaceTab; label: string; icon: typeof BookText; badge?: number | string }[] = [
     {
       id: 'overview',
       label: 'ภาพรวม & โครงเรื่องหลัก',
@@ -62,6 +76,12 @@ export function Workspace() {
       label: 'โครงสร้างรายตอน',
       icon: ListOrdered,
       badge: activeProject.chapters.length,
+    },
+    {
+      id: 'writer',
+      label: 'แต่งนิยายเต็มตอน',
+      icon: Feather,
+      badge: `${writtenCount}/${activeProject.chapters.length}`,
     },
   ];
 
@@ -111,6 +131,16 @@ export function Workspace() {
 
           <button
             type="button"
+            onClick={() => setAuditOpen(true)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border border-emerald-200 bg-emerald-50/70 text-emerald-800 hover:bg-emerald-100 transition-colors"
+            title="ให้ AI บรรณาธิการตรวจพล็อตโฮลทั้งเรื่อง"
+          >
+            <ShieldCheck className="w-3.5 h-3.5" />
+            ตรวจพล็อตโฮล
+          </button>
+
+          <button
+            type="button"
             onClick={undoActiveProject}
             disabled={undoStack.length === 0}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border border-stone-200 text-stone-700 hover:bg-stone-50 disabled:opacity-40 transition-colors"
@@ -134,7 +164,47 @@ export function Workspace() {
             {exportOpen && (
               <>
                 <div className="fixed inset-0 z-10" onClick={() => setExportOpen(false)} />
-                <div className="absolute right-0 mt-2 w-56 bg-white rounded-xl shadow-xl border border-stone-200 py-1.5 z-20">
+                <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-xl border border-stone-200 py-1.5 z-20">
+                  {writtenCount > 0 && (
+                    <>
+                      <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-violet-600">
+                        ต้นฉบับนิยาย ({writtenCount} ตอนที่แต่งแล้ว)
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          exportManuscriptAsMarkdown(activeProject);
+                          setExportOpen(false);
+                        }}
+                        className="w-full px-3.5 py-2 text-left text-xs font-medium text-stone-700 hover:bg-violet-50 hover:text-violet-800 flex items-center gap-2.5"
+                      >
+                        <BookOpenText className="w-4 h-4 text-violet-600" />
+                        <div>
+                          <p className="font-semibold">ต้นฉบับนิยาย (.md)</p>
+                          <p className="text-[10px] text-stone-400">เฉพาะเนื้อเรื่องพร้อมลงเว็บ</p>
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          exportManuscriptAsText(activeProject);
+                          setExportOpen(false);
+                        }}
+                        className="w-full px-3.5 py-2 text-left text-xs font-medium text-stone-700 hover:bg-violet-50 hover:text-violet-800 flex items-center gap-2.5"
+                      >
+                        <FileText className="w-4 h-4 text-violet-500" />
+                        <div>
+                          <p className="font-semibold">ต้นฉบับนิยาย (.txt)</p>
+                          <p className="text-[10px] text-stone-400">ก๊อปปี้ลง ReadAWrite / Dek-D</p>
+                        </div>
+                      </button>
+                      <div className="my-1 border-t border-stone-100" />
+                    </>
+                  )}
+
+                  <div className="px-3.5 py-1 text-[10px] font-bold uppercase tracking-wider text-stone-400">
+                    โครงเรื่องทั้งหมด (Outline & Lore)
+                  </div>
                   <button
                     type="button"
                     onClick={() => {
@@ -204,7 +274,7 @@ export function Workspace() {
         </div>
       )}
 
-      {/* 4 Workspace Tabs */}
+      {/* 5 Workspace Tabs */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-2 mb-5 border-b border-stone-200">
         {tabs.map((tab) => {
           const Icon = tab.icon;
@@ -216,13 +286,15 @@ export function Workspace() {
               onClick={() => setActiveTab(tab.id)}
               className={`inline-flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold whitespace-nowrap transition-all ${
                 active
-                  ? 'bg-indigo-600 text-white shadow-xs'
+                  ? tab.id === 'writer'
+                    ? 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white shadow-xs'
+                    : 'bg-indigo-600 text-white shadow-xs'
                   : 'text-stone-600 hover:bg-stone-200/60 hover:text-stone-900'
               }`}
             >
               <Icon className="w-4 h-4" />
               <span>{tab.label}</span>
-              {typeof tab.badge === 'number' && (
+              {tab.badge !== undefined && (
                 <span
                   className={`text-[11px] px-1.5 py-0.5 rounded-full font-bold ${
                     active ? 'bg-white/20 text-white' : 'bg-stone-200/80 text-stone-600'
@@ -241,6 +313,9 @@ export function Workspace() {
       {activeTab === 'world' && <WorldBuildingTab />}
       {activeTab === 'characters' && <CharactersTab />}
       {activeTab === 'chapters' && <ChaptersTab />}
+      {activeTab === 'writer' && <WriterTab />}
+
+      <ContinuityAuditModal open={auditOpen} onClose={() => setAuditOpen(false)} />
     </main>
   );
 }

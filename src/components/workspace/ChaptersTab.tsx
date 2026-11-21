@@ -171,6 +171,7 @@ export function ChaptersTab() {
         outcome: '',
         cliffhanger: '',
         summary: '',
+        content: '',
       });
       return p;
     });

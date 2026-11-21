@@ -1,14 +1,20 @@
 import { GoogleGenAI, HarmBlockThreshold, HarmCategory, Type, type Schema } from '@google/genai';
-import { getStructureById } from '../data/knowledgeBase';
+import { GENRES, STORY_STRUCTURES, getStructureById } from '../data/knowledgeBase';
 import { getPresetById } from '../data/aiProviders';
 import {
+  AutoDirectorPlanSchema,
   ChapterBatchResponseSchema,
   ChapterBeatSchema,
+  ContinuityReportSchema,
   MacroOutlineResponseSchema,
+  OpeningHookSamplesSchema,
   type AISettings,
+  type AutoDirectorPlan,
   type ChapterBeat,
   type CharacterItem,
+  type ContinuityReport,
   type NovelProject,
+  type OpeningHookSamples,
   type PlotBeat,
   type WorldBuildingItem,
 } from '../types/novel';
@@ -997,4 +1003,496 @@ ${steeringPrompt?.trim() ? `ความต้องการเพิ่มเ�
   const validator = z.object({ logline: z.string().min(1) });
   const res = await generateStructuredJson({ apiKey, settings, prompt, schema, jsonContract, validator, signal, onRetry });
   return res.logline;
+}
+
+// ============================================================================
+// NEW FEATURES: Auto-Director, Style Anchor, Stage 3 Prose Writer, Continuity Audit
+// ============================================================================
+
+const PROSE_WRITER_SYSTEM_INSTRUCTION = `คุณคือ "นักเขียนนิยายภาษาไทยมืออาชีพระดับเบสต์เซลเลอร์" (Master Thai Fiction Novelist)
+หน้าที่ของคุณคือเขียนเนื้อหานิยายภาษาไทยฉบับเต็ม (Prose) ที่อ่านสนุก ลื่นไหล มีชีวิตชีวา และชวนติดตาม
+
+กฎเหล็กในการเขียนนิยาย:
+1. เขียนเป็นเนื้อหานิยายภาษาไทยเต็มรูปแบบพร้อมอ่านทันที (ห้ามเขียนเป็นหัวข้อย่อ ห้ามใส่คำทักทายหรือคำอธิบายนอกเนื้อเรื่อง)
+2. ใช้ภาษาไทยที่สละสลวย เป็นธรรมชาติแบบนักเขียนไทยแท้ ห้ามใช้สำนวนแปลตรงตัวจากภาษาอังกฤษ
+3. ใช้หลัก "Show, Don't Tell" — แสดงอารมณ์ผ่านการกระทำ บทสนทนา สีหน้า และบรรยากาศ แทนการเล่าสรุปทื่อๆ
+4. ยึดข้อมูลที่ปักหมุด (Pinned Lore & Characters) อย่างเคร่งครัด ห้ามเปลี่ยนชื่อ นิสัย ปม หรือกฎของโลก
+5. เชื่อมต่ออารมณ์และฉากจากตอนก่อนหน้าให้เนียนสนิท และจบตอนด้วย Cliffhanger ที่ชวนให้อยากอ่านตอนต่อไปทันที`;
+
+async function generateRawText(params: {
+  apiKey: string;
+  settings: AISettings;
+  systemInstruction: string;
+  prompt: string;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<string> {
+  const { apiKey, settings, systemInstruction, prompt, signal, onRetry } = params;
+  validateConfig(apiKey, settings);
+
+  const maxRetries = 3;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (signal?.aborted) {
+      throw new AIServiceError('ยกเลิกการทำงานแล้ว', 'ABORTED');
+    }
+
+    try {
+      if (settings.provider === 'gemini') {
+        const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
+        const response = await ai.models.generateContent({
+          model: settings.model.trim(),
+          contents: prompt,
+          config: {
+            systemInstruction,
+            temperature: settings.temperature,
+            safetySettings: FICTION_SAFETY_SETTINGS,
+            abortSignal: signal,
+          },
+        });
+        const finishReason = response.candidates?.[0]?.finishReason;
+        if (finishReason === 'SAFETY' || finishReason === 'PROHIBITED_CONTENT' || finishReason === 'BLOCKLIST') {
+          throw new AIServiceError(
+            'เนื้อหาบางส่วนถูกระบบความปลอดภัยของ Gemini กรองไว้ ลองปรับรายละเอียดฉากให้ลดความรุนแรงลงเล็กน้อยแล้วลองใหม่ครับ',
+            'SAFETY'
+          );
+        }
+        if (!response.text?.trim()) {
+          throw new AIServiceError('AI ไม่ได้ส่งเนื้อเรื่องกลับมา กรุณาลองใหม่อีกครั้ง', 'VALIDATION');
+        }
+        return response.text.trim();
+      }
+
+      if (settings.provider === 'anthropic') {
+        const res = await apiFetch(
+          `${normalizeBaseUrl(settings.baseUrl)}/messages`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-api-key': apiKey.trim(),
+              'anthropic-version': '2023-06-01',
+              'anthropic-dangerous-direct-browser-access': 'true',
+            },
+            body: JSON.stringify({
+              model: settings.model.trim(),
+              max_tokens: 8192,
+              temperature: Math.min(1, settings.temperature),
+              system: systemInstruction,
+              messages: [{ role: 'user', content: prompt }],
+            }),
+            signal,
+          },
+          settings.useCorsProxy
+        );
+        if (!res.ok) {
+          const errText = await res.text().catch(() => '');
+          throw new Error(`HTTP ${res.status}: ${errText.slice(0, 300)}`);
+        }
+        const data = await res.json();
+        const textBlock = Array.isArray(data?.content)
+          ? data.content.find((b: { type?: string }) => b.type === 'text')
+          : null;
+        if (!textBlock?.text?.trim()) {
+          throw new AIServiceError('Claude ไม่ได้ส่งเนื้อเรื่องกลับมา กรุณาลองใหม่อีกครั้ง', 'VALIDATION');
+        }
+        return textBlock.text.trim();
+      }
+
+      // OpenAI-compatible
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (apiKey.trim()) headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+      if (settings.baseUrl.includes('openrouter.ai')) {
+        headers['HTTP-Referer'] = window.location.origin;
+        headers['X-Title'] = 'PlotCraft TH Novel Outliner';
+      }
+
+      const res = await apiFetch(
+        `${normalizeBaseUrl(settings.baseUrl)}/chat/completions`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            model: settings.model.trim(),
+            temperature: settings.temperature,
+            messages: [
+              { role: 'system', content: systemInstruction },
+              { role: 'user', content: prompt },
+            ],
+          }),
+          signal,
+        },
+        settings.useCorsProxy
+      );
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}: ${errText.slice(0, 300)}`);
+      }
+      const data = await res.json();
+      const content = data?.choices?.[0]?.message?.content;
+      if (typeof content !== 'string' || !content.trim()) {
+        throw new AIServiceError('AI ไม่ได้ส่งเนื้อเรื่องกลับมา กรุณาลองใหม่อีกครั้ง', 'VALIDATION');
+      }
+      return content.trim();
+    } catch (err) {
+      const classified = classifyError(err);
+      if (classified.code === 'ABORTED' || classified.code === 'AUTH' || classified.code === 'SAFETY') {
+        throw classified;
+      }
+      if (classified.code === 'RATE_LIMIT' && attempt < maxRetries) {
+        const waitMs = Math.pow(2, attempt + 1) * 1000;
+        onRetry?.(attempt + 1, waitMs);
+        await sleep(waitMs, signal);
+        continue;
+      }
+      throw classified;
+    }
+  }
+
+  throw new AIServiceError('ไม่สามารถเชื่อมต่อ AI API ได้', 'UNKNOWN');
+}
+
+export async function analyzeIdeaAutoDirector(params: {
+  apiKey: string;
+  settings: AISettings;
+  seedIdea: string;
+  tropes: string[];
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<AutoDirectorPlan> {
+  const { apiKey, settings, seedIdea, tropes, signal, onRetry } = params;
+  const genreNames = GENRES.map((g) => g.nameTh).join(', ');
+  const structureList = STORY_STRUCTURES.map((s) => `"${s.id}" (${s.nameTh}: ${s.bestFor})`).join('\n');
+
+  const prompt = `วิเคราะห์ไอเดียนิยายด้านล่าง แล้วทำหน้าที่เป็น "บรรณาธิการผู้กำกับเรื่อง (AI Story Director)" เลือกองค์ประกอบทั้งหมดที่เหมาะสมที่สุดให้ผู้เขียนแบบสำเร็จรูป
+
+ไอเดียของผู้เขียน:
+"""
+${seedIdea.trim()}
+"""
+${tropes.length > 0 ? `รสชาติ/Trope ที่ผู้เขียนอยากผสมเข้าไป: ${tropes.join(', ')}` : ''}
+
+เงื่อนไขการเลือก:
+1. titleOptions: เสนอชื่อเรื่องภาษาไทยที่ดึงดูดและน่าคลิก 3 ตัวเลือก (สไตล์ต่างกันเล็กน้อย เช่น แนวตลาดชวนคลิก, แนวลึกลับ/อารมณ์, แนวสละสลวย)
+2. genres: เลือก 1-3 แนวจากรายการนี้เท่านั้น: [${genreNames}]
+3. structureTemplate: เลือก 1 ทฤษฎีที่เหมาะกับไอเดียนี้ที่สุด โดยใช้ชื่อ ID ตรงเป๊ะจากรายการนี้:
+${structureList}
+4. structureReason: อธิบายเหตุผลภาษาไทยสั้นๆ 1-2 ประโยคว่าทำไมทฤษฎีนี้เหมาะกับไอเดียนี้
+5. tone, targetAudience, targetChapterCount (เลือก 10, 15, 20, 25, หรือ 30 ตามความเหมาะสมของสเกลเรื่อง), pov, proseStyle, chapterLength ("short" | "medium" | "long")`;
+
+  const jsonContract = `{
+  "titleOptions": ["ชื่อเรื่องที่ 1", "ชื่อเรื่องที่ 2", "ชื่อเรื่องที่ 3"],
+  "genres": ["แฟนตาซี", "สืบสวนสอบสวนและระทึกขวัญ"],
+  "structureTemplate": "Save the Cat!",
+  "structureReason": "เหตุผลที่เลือกทฤษฎีนี้",
+  "tone": "โทนเรื่องที่เหมาะสม",
+  "targetAudience": "กลุ่มเป้าหมาย",
+  "targetChapterCount": 20,
+  "pov": "บุรุษที่ 3 (ผู้เล่าเรื่อง — มองเห็นภาพรวม)",
+  "proseStyle": "กระชับ อ่านไว สไตล์เว็บโนเวล (ReadAWrite / Dek-D)",
+  "chapterLength": "medium"
+}`;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      titleOptions: { type: Type.ARRAY, items: { type: Type.STRING } },
+      genres: { type: Type.ARRAY, items: { type: Type.STRING } },
+      structureTemplate: { type: Type.STRING },
+      structureReason: { type: Type.STRING },
+      tone: { type: Type.STRING },
+      targetAudience: { type: Type.STRING },
+      targetChapterCount: { type: Type.INTEGER },
+      pov: { type: Type.STRING },
+      proseStyle: { type: Type.STRING },
+      chapterLength: { type: Type.STRING, enum: ['short', 'medium', 'long'] },
+    },
+    required: [
+      'titleOptions',
+      'genres',
+      'structureTemplate',
+      'structureReason',
+      'tone',
+      'targetAudience',
+      'targetChapterCount',
+      'pov',
+      'proseStyle',
+      'chapterLength',
+    ],
+  };
+
+  const result = await generateStructuredJson({
+    apiKey,
+    settings,
+    prompt,
+    schema,
+    jsonContract,
+    validator: AutoDirectorPlanSchema,
+    signal,
+    onRetry,
+  });
+
+  // Ensure genres & structureTemplate map cleanly to built-in values
+  const validGenreNames = new Set(GENRES.map((g) => g.nameTh));
+  const cleanGenres = result.genres.filter((g) => validGenreNames.has(g)).slice(0, 3);
+  const validStructure = STORY_STRUCTURES.find((s) => s.id === result.structureTemplate)?.id ?? STORY_STRUCTURES[1].id;
+
+  return {
+    ...result,
+    genres: cleanGenres.length > 0 ? cleanGenres : [GENRES[0].nameTh],
+    structureTemplate: validStructure,
+  };
+}
+
+export async function generateOpeningHookSamples(params: {
+  apiKey: string;
+  settings: AISettings;
+  project: NovelProject;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<OpeningHookSamples> {
+  const { apiKey, settings, project, signal, onRetry } = params;
+  const ch1 = project.chapters[0];
+  const ch1Context = ch1
+    ? `ตอนที่ 1: "${ch1.title}" — เป้าหมาย: ${ch1.goal} | สรุป: ${ch1.summary}`
+    : `เปิดเรื่องตาม Logline และ Beat แรก: ${project.macroOutline.plotBeats[0]?.summary ?? project.macroOutline.logline}`;
+
+  const prompt = `${buildPinnedContextBlock(project)}
+
+ข้อมูลฉากเปิดเรื่อง:
+${ch1Context}
+มุมมองการเล่า (POV): ${project.metadata.writingStyle?.pov ?? 'บุรุษที่ 3'}
+
+คำสั่ง: เขียน "ตัวอย่างย่อหน้าเปิดเรื่อง (2-3 ย่อหน้า)" ของนิยายเรื่องนี้ใน 3 สไตล์ภาษาที่แตกต่างกัน เพื่อให้ผู้เขียนเลือกสไตล์ที่ชอบเป็นต้นแบบ (Style Anchor) สำหรับการแต่งทั้งเรื่อง:
+1. สไตล์เว็บโนเวลกระชับ อ่านไว ดึงดูดทันที (Fast-Paced Web Novel)
+2. สไตล์วรรณกรรมภาษาสวย เน้นบรรยากาศและอารมณ์ลึกซึ้ง (Atmospheric Literary)
+3. สไตล์ดราม่า/ระทึกขวัญ เปิดด้วยแรงปะทะหรือบทสนทนาชวนสงสัย (Punchy & Dramatic)`;
+
+  const jsonContract = `{
+  "samples": [
+    {
+      "styleName": "ชื่อสไตล์ที่ 1",
+      "description": "จุดเด่นของสำนวนนี้ 1 ประโยค",
+      "excerpt": "เนื้อหานิยายตัวอย่าง 2-3 ย่อหน้า..."
+    }
+  ]
+}`;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      samples: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            styleName: { type: Type.STRING },
+            description: { type: Type.STRING },
+            excerpt: { type: Type.STRING },
+          },
+          required: ['styleName', 'description', 'excerpt'],
+        },
+      },
+    },
+    required: ['samples'],
+  };
+
+  return generateStructuredJson({
+    apiKey,
+    settings,
+    prompt,
+    schema,
+    jsonContract,
+    validator: OpeningHookSamplesSchema,
+    signal,
+    onRetry,
+  });
+}
+
+export async function writeChapterProse(params: {
+  apiKey: string;
+  settings: AISettings;
+  project: NovelProject;
+  chapterIndex: number;
+  steeringPrompt?: string;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<string> {
+  const { apiKey, settings, project, chapterIndex, steeringPrompt, signal, onRetry } = params;
+  const chapter = project.chapters[chapterIndex];
+  const prevChapter = chapterIndex > 0 ? project.chapters[chapterIndex - 1] : null;
+  const ws = project.metadata.writingStyle ?? {
+    pov: 'บุรุษที่ 3 (ผู้เล่าเรื่อง)',
+    proseStyle: 'กระชับ อ่านไว สไตล์เว็บโนเวล',
+    chapterLength: 'medium',
+    styleAnchor: '',
+  };
+
+  const lengthGuide =
+    ws.chapterLength === 'short'
+      ? 'ความยาวประมาณ 1,200–1,800 คำ (กระชับ ฉับไว)'
+      : ws.chapterLength === 'long'
+        ? 'ความยาวประมาณ 3,200–4,200 คำ (ละเอียด ลึกซึ้ง ขยี้ทุกฉากสำคัญ)'
+        : 'ความยาวประมาณ 2,000–2,800 คำ (สมดุล มาตรฐานนิยายออนไลน์)';
+
+  const prevEnding = prevChapter?.content?.trim()
+    ? `ข้อความช่วงท้ายของตอนก่อนหน้า (ตอนที่ ${prevChapter.chapterNumber}) เพื่อต่อฉากให้เนียนสนิท:\n"""\n${prevChapter.content.trim().slice(-700)}\n"""`
+    : prevChapter
+      ? `สรุปตอนก่อนหน้า (ตอนที่ ${prevChapter.chapterNumber}: ${prevChapter.title}): ${prevChapter.summary} | จุดทิ้งท้าย: ${prevChapter.cliffhanger}`
+      : 'นี่คือตอนที่ 1 ของเรื่อง ให้เปิดฉากอย่างทรงพลังและดึงดูดผู้อ่านตั้งแต่วรรคแรก';
+
+  const styleAnchorBlock = ws.styleAnchor?.trim()
+    ? `\n[STYLE ANCHOR / ต้นแบบสำนวนภาษาที่ต้องเลียนแบบโทนและจังหวะให้สอดคล้อง]:\n"""\n${ws.styleAnchor.trim()}\n"""`
+    : '';
+
+  const prompt = `${buildPinnedContextBlock(project)}
+
+[การตั้งค่าสไตล์การเขียน]:
+- มุมมองการเล่า (POV): ${ws.pov}
+- สไตล์ภาษา: ${ws.proseStyle}
+- ความยาวเป้าหมาย: ${lengthGuide}
+${styleAnchorBlock}
+
+[ความต่อเนื่องจากตอนก่อนหน้า]:
+${project.rollingSummary ? `Rolling Summary: ${project.rollingSummary}\n` : ''}${prevEnding}
+
+[โครงสร้างบังคับของตอนที่ ${chapter.chapterNumber}: "${chapter.title}"]:
+- จังหวะเรื่อง: ${chapter.linkedBeat || '-'}
+- เป้าหมายในตอน (Goal): ${chapter.goal}
+- อุปสรรค/ความขัดแย้ง (Conflict): ${chapter.conflict}
+- ผลลัพธ์ (Outcome): ${chapter.outcome}
+- จุดทิ้งท้าย (Cliffhanger): ${chapter.cliffhanger}
+- เรื่องย่อตอน: ${chapter.summary}
+${steeringPrompt?.trim() ? `\n[คำสั่งเพิ่มเติมจากนักเขียนสำหรับตอนนี้]: ${steeringPrompt.trim()}` : ''}
+
+คำสั่ง: จงเขียนเนื้อหานิยายฉบับเต็มของ **ตอนที่ ${chapter.chapterNumber}: ${chapter.title}** เป็นภาษาไทยที่สละสลวย พร้อมอ่านทันที (เริ่มเนื้อเรื่องได้เลย ไม่ต้องใส่คำทักทายหรือหมายเหตุท้ายตอน)`;
+
+  return generateRawText({
+    apiKey,
+    settings,
+    systemInstruction: PROSE_WRITER_SYSTEM_INSTRUCTION,
+    prompt,
+    signal,
+    onRetry,
+  });
+}
+
+export async function refineChapterProse(params: {
+  apiKey: string;
+  settings: AISettings;
+  project: NovelProject;
+  chapterIndex: number;
+  instruction: string;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<string> {
+  const { apiKey, settings, project, chapterIndex, instruction, signal, onRetry } = params;
+  const chapter = project.chapters[chapterIndex];
+  const ws = project.metadata.writingStyle;
+
+  const prompt = `คุณกำลังปรับปรุงต้นฉบับนิยายภาษาไทยเรื่อง "${project.metadata.title}" (แนว: ${project.metadata.genres.join(', ')}, โทน: ${project.metadata.tone}, POV: ${ws?.pov ?? 'บุรุษที่ 3'})
+
+ตอนที่ ${chapter.chapterNumber}: ${chapter.title}
+คำสั่งการปรับปรุงจากนักเขียน: "${instruction.trim()}"
+
+กฎ:
+- คงเหตุการณ์สำคัญ ชื่อตัวละคร และจุดทิ้งท้ายของตอนเดิมไว้ครบถ้วน
+- ปรับปรุงเนื้อหาตามคำสั่งของนักเขียนให้ดียิ่งขึ้นชัดเจน
+- ตอบกลับเป็นเนื้อหานิยายฉบับปรับปรุงเต็มตอนเท่านั้น ห้ามใส่คำอธิบายนอกเนื้อเรื่อง
+
+ต้นฉบับเดิม:
+"""
+${chapter.content}
+"""`;
+
+  return generateRawText({
+    apiKey,
+    settings,
+    systemInstruction: PROSE_WRITER_SYSTEM_INSTRUCTION,
+    prompt,
+    signal,
+    onRetry,
+  });
+}
+
+export async function auditProjectContinuity(params: {
+  apiKey: string;
+  settings: AISettings;
+  project: NovelProject;
+  signal?: AbortSignal;
+  onRetry?: (attempt: number, waitMs: number) => void;
+}): Promise<ContinuityReport> {
+  const { apiKey, settings, project, signal, onRetry } = params;
+
+  const chaptersSummary =
+    project.chapters.length > 0
+      ? project.chapters
+          .map(
+            (ch) =>
+              `ตอนที่ ${ch.chapterNumber} (${ch.title}) [${ch.linkedBeat || '-'}]: เป้าหมาย=${ch.goal} | ขัดแย้ง=${ch.conflict} | ผลลัพธ์=${ch.outcome} | ทิ้งท้าย=${ch.cliffhanger} | สรุป=${ch.summary}`
+          )
+          .join('\n')
+      : '(ยังไม่ได้สร้างโครงสร้างรายตอน — ให้ตรวจเฉพาะความสอดคล้องของ Logline, โลก, ตัวละคร และ Plot Beats)';
+
+  const prompt = `ทำหน้าที่เป็น "บรรณาธิการอาวุโสตรวจสอบพล็อตโฮล (Continuity & Plot Hole Auditor)"
+ตรวจสอบโครงเรื่องนิยายทั้งหมดด้านล่างอย่างละเอียด:
+
+${buildPinnedContextBlock(project)}
+
+[โครงสร้างรายตอนทั้งหมด (${project.chapters.length} ตอน)]:
+${chaptersSummary}
+
+สิ่งที่ต้องตรวจสอบ:
+1. ความขัดแย้งกับกฎของโลก (World-Building / Lore Contradiction)
+2. ความไม่สม่ำเสมอของตัวละคร (ชื่อเพี้ยน, นิสัย/ปมหลุดจากที่ปักหมุด, หายไปดื้อๆ)
+3. รูโหว่ของพล็อต (Plot Holes) หรือเหตุการณ์ที่ไม่สมเหตุสมผล
+4. จังหวะเรื่อง (Pacing) — ช่วงไหนยืดเยื้อ เร่งเกินไป หรือไม่ตรงตามทฤษฎีโครงเรื่อง
+5. ให้คะแนนความสมเหตุสมผลโดยรวม (overallScore 0-100), สรุปภาพรวม (summary), และรายการปัญหาพร้อมคำแนะนำวิธีแก้ที่ทำได้จริง (issues)`;
+
+  const jsonContract = `{
+  "overallScore": 85,
+  "summary": "สรุปจุดแข็งและภาพรวมความต่อเนื่องของโครงเรื่อง 2-3 ประโยค",
+  "issues": [
+    {
+      "severity": "high",
+      "category": "พล็อตโฮล / ตัวละคร / กฎของโลก / จังหวะเรื่อง",
+      "location": "ระบุตำแหน่ง เช่น ตอนที่ 4 หรือ ตัวละคร A",
+      "description": "อธิบายปัญหาที่พบอย่างชัดเจน",
+      "suggestion": "แนวทางแก้ไขที่แนะนำ"
+    }
+  ]
+}`;
+
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: {
+      overallScore: { type: Type.INTEGER },
+      summary: { type: Type.STRING },
+      issues: {
+        type: Type.ARRAY,
+        items: {
+          type: Type.OBJECT,
+          properties: {
+            severity: { type: Type.STRING, enum: ['high', 'medium', 'low'] },
+            category: { type: Type.STRING },
+            location: { type: Type.STRING },
+            description: { type: Type.STRING },
+            suggestion: { type: Type.STRING },
+          },
+          required: ['severity', 'category', 'location', 'description', 'suggestion'],
+        },
+      },
+    },
+    required: ['overallScore', 'summary', 'issues'],
+  };
+
+  return generateStructuredJson({
+    apiKey,
+    settings,
+    prompt,
+    schema,
+    jsonContract,
+    validator: ContinuityReportSchema,
+    signal,
+    onRetry,
+  });
 }
